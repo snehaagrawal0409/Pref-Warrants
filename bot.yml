@@ -1,0 +1,48 @@
+name: Preferential Warrant Bot
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # every hour at :00
+  workflow_dispatch:        # manual trigger from Actions tab
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore seen IDs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_ids.json
+          key: seen-ids-${{ github.run_id }}
+          restore-keys: seen-ids-
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          GOOGLE_SHEET_ID:     ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON:   ${{ secrets.GOOGLE_CREDS_JSON }}
+          SEEN_IDS_FILE:       seen_ids.json
+          LOOKBACK_HOURS:      "24"
+        run: python src/bot.py
+
+      - name: Save seen IDs cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen_ids.json
+          key: seen-ids-${{ github.run_id }}

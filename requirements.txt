@@ -1,0 +1,6 @@
+requests==2.32.3
+beautifulsoup4==4.12.3
+gspread==6.1.2
+google-auth==2.29.0
+python-telegram-bot==20.8
+lxml==5.2.2
