@@ -40,12 +40,14 @@ LOOKBACK_HOURS      = int(os.environ.get("LOOKBACK_HOURS", "24"))
 
 # ── Keywords ───────────────────────────────────────────────────────────────────
 KEYWORDS = [
+    # Core preferential
     "preferential issue",
     "preferential allotment",
     "preferential placement",
     "preferential basis",
     "preferential issue of warrants",
     "preferential issue of shares",
+    # Warrants
     "issue of warrants",
     "convertible warrants",
     "allotment of warrants",
@@ -53,16 +55,16 @@ KEYWORDS = [
     "warrants conversion",
     "conversion of warrants into equity",
     "allotment of equity shares upon exercise of warrants",
+    # Capital markets
     "private placement",
     "qualified institutional placement",
-    "board approval",
-    "outcome of board meeting",
-    "postal ballot",
-    "egm notice",
+    # Approvals & stages
     "in-principle approval",
     "in-principle preferential",
+    # Allottee types
     "promoter allotment",
     "non-promoter allotment",
+    # Financial terms
     "fund raising",
     "capital raising",
     "issue price",
@@ -72,6 +74,7 @@ KEYWORDS = [
     "balance consideration",
     "further allotment",
     "tranche allotment",
+    # Broad catch-alls
     "warrant",
     "warrants",
     "preferential",
@@ -120,8 +123,15 @@ def make_uid(*parts) -> str:
 # ── Google Sheets ──────────────────────────────────────────────────────────────
 
 SHEET_HEADERS = [
-    "Timestamp (IST)", "Source", "Company", "Symbol",
-    "Heading", "Summary", "URL", "Unique ID",
+    "Timestamp (IST)",   # A - when the announcement was made
+    "Source",            # B - NSE / BSE / Screener
+    "Company",           # C - full company name
+    "Symbol",            # D - ticker / scrip code
+    "Heading",           # E - announcement title
+    "Summary",           # F - brief description (Screener provides this)
+    "First Disclosure",  # G - YES if this company's first preferential announcement, else NO
+    "URL",               # H - link to filing / PDF
+    "Unique ID",         # I - dedup fingerprint
 ]
 
 
@@ -136,20 +146,64 @@ def get_sheet():
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try:
         ws = sh.worksheet("Announcements")
+        # If sheet exists but is missing the First Disclosure column, add it
+        existing_headers = ws.row_values(1)
+        if "First Disclosure" not in existing_headers and len(existing_headers) >= 6:
+            # Insert "First Disclosure" before URL (was col G, now shifting)
+            # Simplest: clear row 1 and rewrite all headers
+            ws.update("A1:I1", [SHEET_HEADERS])
+            ws.format("A1:I1", {"textFormat": {"bold": True}})
+            log.info("Updated sheet headers to include 'First Disclosure'")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="Announcements", rows=10000, cols=len(SHEET_HEADERS))
         ws.append_row(SHEET_HEADERS, value_input_option="RAW")
         ws.freeze(rows=1)
-        ws.format("A1:H1", {"textFormat": {"bold": True}})
-        log.info("Created new 'Announcements' worksheet")
+        ws.format("A1:I1", {"textFormat": {"bold": True}})
+        # Set column widths for readability
+        log.info("Created new 'Announcements' worksheet with all headers")
     return ws
 
 
-def sheet_append(ws, ann: dict):
+def get_seen_companies(ws) -> set:
+    """
+    Read all company+symbol values already in the sheet.
+    Used to determine if an announcement is the FIRST for that company.
+    """
+    try:
+        all_values = ws.get_all_values()
+        # Column C (index 2) = Company, Column D (index 3) = Symbol
+        seen = set()
+        for row in all_values[1:]:   # skip header
+            if len(row) >= 4:
+                key = (row[2].strip().lower(), row[3].strip().lower())
+                seen.add(key)
+        return seen
+    except Exception:
+        return set()
+
+
+def sheet_append(ws, ann: dict, seen_companies: set) -> set:
+    """
+    Append one row. Determines First Disclosure by checking seen_companies.
+    Updates seen_companies in-place and returns it.
+    """
+    key = (ann["company"].strip().lower(), ann["symbol"].strip().lower())
+    is_first = "YES ⭐" if key not in seen_companies else "NO"
+    seen_companies.add(key)
+
     ws.append_row([
-        ann["ts"], ann["source"], ann["company"], ann["symbol"],
-        ann["heading"], ann["summary"], ann["url"], ann["uid"],
+        ann["ts"],
+        ann["source"],
+        ann["company"],
+        ann["symbol"],
+        ann["heading"],
+        ann["summary"],
+        is_first,
+        ann["url"],
+        ann["uid"],
     ], value_input_option="USER_ENTERED")
+
+    return seen_companies
 
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
@@ -160,10 +214,11 @@ def escape_md(text: str) -> str:
 
 def format_msg(ann: dict) -> str:
     sym_part = f" \\({escape_md(ann['symbol'])}\\)" if ann.get("symbol") else ""
+    first_badge = "⭐ *FIRST DISCLOSURE*\n" if ann.get("first_disclosure") else ""
     lines = [
         f"🔔 *{escape_md(ann['source'])} \\| Preferential Warrant Alert*",
         "",
-        f"🏢 *{escape_md(ann['company'])}*{sym_part}",
+        first_badge + f"🏢 *{escape_md(ann['company'])}*{sym_part}",
         f"📌 {escape_md(ann['heading'])}",
     ]
     if ann.get("summary"):
@@ -437,13 +492,26 @@ async def main():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     posted = 0
 
+    # Load companies already in the sheet (for First Disclosure detection)
+    seen_companies = get_seen_companies(ws)
+    log.info("Companies already in sheet: %d", len(seen_companies))
+
     for ann in new_items:
         try:
-            sheet_append(ws, ann)
+            # Determine first disclosure BEFORE appending (so this row counts)
+            key = (ann["company"].strip().lower(), ann["symbol"].strip().lower())
+            ann["first_disclosure"] = key not in seen_companies
+
+            # 1. Google Sheet first
+            seen_companies = sheet_append(ws, ann, seen_companies)
+
+            # 2. Telegram second
             await send_telegram_async(bot, ann)
+
             seen.add(ann["uid"])
             posted += 1
-            log.info("[%s] %s | %s", ann["source"], ann["company"], ann["heading"][:70])
+            first_flag = " [FIRST]" if ann["first_disclosure"] else ""
+            log.info("[%s]%s %s | %s", ann["source"], first_flag, ann["company"], ann["heading"][:60])
         except Exception as e:
             log.error("Failed for %s: %s", ann["uid"], e)
             seen.add(ann["uid"])
